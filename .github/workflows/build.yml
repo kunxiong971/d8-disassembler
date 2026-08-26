@@ -67,6 +67,15 @@ jobs:
           mkdir $release
           cp "..\..\scripts\args.gn" "$release\args.gn" -Force
           gn gen $release
+
+          # Fix Torque-vs-C++ layout mismatch in generated JSInterceptorMap
+          # (needed for V8 15.0.245.28). See scripts/fix_torque_layout.py.
+          $fix = Join-Path $env:GITHUB_WORKSPACE "scripts\fix_torque_layout.py"
+          if (-not (Test-Path $fix)) { throw "fix_torque_layout.py not found: $fix" }
+          Write-Host "[fix_torque_layout] patching generated JSInterceptorMap..."
+          python $fix $release
+          if ($LASTEXITCODE -ne 0) { throw "fix_torque_layout failed (exit $LASTEXITCODE)" }
+
           ninja -C $release d8
 
           $artifact = "d8-with-disassembler-$env:V8_BRANCH"
