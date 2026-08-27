@@ -29,9 +29,9 @@ Semantics:
   - If a constant is present and at the WRONG value -> it is rewritten (fixed).
   - If a constant is present and ALREADY correct -> not rewritten (OK; e.g. an
     already-patched checkout or a version whose Torque agrees with C++).
-  - If constants are NOT present at all and no block matched -> we could not
-    adapt to the real format -> dump diagnostics and exit 1 so the CI log shows
-    exactly what the generated file looks like.
+  - If constants are NOT rewritten at all -> we dump the file content to the
+    log and exit 1, so the CI log reveals the exact generated format and we can
+    adjust CLASS_RE / FIX without guessing.
 """
 
 import re
@@ -49,6 +49,26 @@ FIX = {
 # Match a class/struct whose body holds the constants. Torque emits a trailing
 # "Definition" for cpp object layout definitions; the plain name is the fallback.
 CLASS_RE = re.compile(r"(?m)\b(?:class|struct)\s+JSInterceptorMap(?:Definition)?\b")
+
+# Any line that could carry a layout/offset/constant declaration.
+EVIDENCE_RE = re.compile(
+    r"offset|kSize|constexpr|Interceptor|static_assert|kStart|kEnd|Layout|"
+    r"k[A-Za-z_]*Offset|Definition"
+)
+
+
+def dump_file(path, lines):
+    """Print a file's prologue + all 'evidence' lines for diagnosis."""
+    name = path
+    print(f"[fix_torque_layout] ============================================================")
+    print(f"[fix_torque_layout] DUMP {name}  (total lines={len(lines)})")
+    print(f"[fix_torque_layout] ----- prologue (first 80 lines) -----")
+    for i, ln in enumerate(lines[:80], 1):
+        print(f"[fix_torque_layout] {name}:{i:04d}| {ln}")
+    print(f"[fix_torque_layout] ----- all evidence lines -----")
+    for i, ln in enumerate(lines, 1):
+        if EVIDENCE_RE.search(ln):
+            print(f"[fix_torque_layout] {name}:{i:04d}| {ln}")
 
 
 def find_class_block(text):
@@ -76,6 +96,11 @@ def find_class_block(text):
 def rewrite_constants(seg_text, label):
     """Rewrite the four known constants within a text segment.
 
+    Handles the generated definition forms seen across .cc/.inc/.h:
+      kX = 44        kX = 44 ;      kX : 44       kX{44}      kX(44)
+      #define kX 44      constexpr int kX = 44
+    It deliberately does NOT touch `kX == ...` (static_assert) expressions.
+
     Returns (new_text, fixed, present) where:
       fixed   = number of constants actually changed
       present = number of constant declarations found (any value)
@@ -84,28 +109,38 @@ def rewrite_constants(seg_text, label):
     fixed = 0
     present = 0
     for name, correct in FIX.items():
-        pat = re.compile(r"(\b" + re.escape(name) + r"\b\s*(?:=|:)\s*)(\d+)")
-        # Diagnostic pass: report each occurrence and whether it is off.
+        # Match `kX` followed by an assignment-style separator then an int literal.
+        pat_assign = re.compile(
+            r"(\b" + re.escape(name) + r"\b\s*(?:=|[:{(])\s*)(\d+)"
+        )
+        # Match `#define kX 44` (whitespace separator, no operator).
+        pat_define = re.compile(
+            r"(#define\s+" + re.escape(name) + r"\s+)(\d+)"
+        )
+        pairs = [(pat_assign, 1), (pat_define, 1)]
         found = False
-        for m in pat.finditer(seg_text):
-            found = True
-            present += 1
-            old_val = int(m.group(2))
-            if old_val != correct:
-                print(
-                    f"[fix_torque_layout] {label}: '{name}' = {old_val} -> {correct}"
-                )
-        if not found:
-            continue
+        for pat, grp in pairs:
+            for m in pat.finditer(seg_text):
+                found = True
+                present += 1
+                old_val = int(m.group(grp + 1))
+                if old_val != correct:
+                    print(
+                        f"[fix_torque_layout] {label}: '{name}' = {old_val} -> {correct}"
+                    )
 
-        # Rewrite pass: count only genuine value changes.
-        def repl(m, c=correct):
-            nonlocal fixed
-            if int(m.group(2)) != c:
-                fixed += 1
-            return m.group(1) + str(c)
+        def make_repl(c=correct):
+            def repl(m, c=c):
+                nonlocal fixed
+                # group(1) = `kX = ` / `kX{` / `#define kX ` ; group(2) = old int
+                if int(m.group(2)) != c:
+                    fixed += 1
+                return m.group(1) + str(c)
+            return repl
 
-        new_text = pat.subn(repl, new_text)[0]
+        for pat, grp in pairs:
+            if pat.search(seg_text):
+                new_text = pat.subn(make_repl(correct), new_text)[0]
     return new_text, fixed, present
 
 
@@ -122,26 +157,21 @@ def patch_file(path):
             text = text[:start] + new_block + text[end:]
             path.write_text(text, encoding="utf-8")
             print(f"[fix_torque_layout] OK patched {path} (block, {fixed} constant(s))")
-        else:
-            print(
-                f"[fix_torque_layout] block found in {path} "
-                f"(present={present}, fixed=0)"
-            )
-        return (True, fixed, present)
-    else:
-        # Fallback: the dedicated layout files are class-specific, so rewrite
-        # the whole file. This is the safety net if the block regex drifts.
-        new_text, fixed, present = rewrite_constants(text, path.name)
-        if fixed:
-            path.write_text(new_text, encoding="utf-8")
-            print(f"[fix_torque_layout] OK patched {path} (whole-file, {fixed} constant(s))")
             return (True, fixed, present)
-        # Nothing fixed and no block matched: dump context for diagnosis.
-        print(f"[fix_torque_layout] NO JSInterceptorMap block and 0 changes in {path}")
-        for i, ln in enumerate(lines, 1):
-            if re.search(r"offset|kSize|constexpr|Interceptor", ln):
-                print(f"[fix_torque_layout]   {path}:{i}: {ln.strip()}")
+        print(f"[fix_torque_layout] block found but 0 constants fixed in {path}; dumping")
+        dump_file(path, lines)
         return (False, fixed, present)
+
+    # No block matched: fall back to whole-file rewrite.
+    new_text, fixed, present = rewrite_constants(text, path.name)
+    if fixed:
+        path.write_text(new_text, encoding="utf-8")
+        print(f"[fix_torque_layout] OK patched {path} (whole-file, {fixed} constant(s))")
+        return (True, fixed, present)
+
+    print(f"[fix_torque_layout] no block and 0 constants fixed in {path}; dumping")
+    dump_file(path, lines)
+    return (False, fixed, present)
 
 
 def main():
@@ -175,10 +205,10 @@ def main():
         print(f"[fix_torque_layout] constants already correct across {len(targets)} file(s); nothing to fix")
         return 0
 
-    # Constants not present at all: we could not adapt to the real generated
-    # format. Fail loudly so the CI log reveals the actual contents.
+    # Constants not fixed at all: could not adapt to the real generated format.
+    # Fail loudly; the dump above reveals the actual constants for us to map.
     print("[fix_torque_layout] ERROR: js-interceptor-map-tq generated, but no JSInterceptorMap layout constants found/rewritten")
-    print("[fix_torque_layout]       Add debugging (see above context dump) or extend CLASS_RE / FIX.")
+    print("[fix_torque_layout]       See dumps above; extend CLASS_RE / FIX with the real names/values.")
     return 1
 
 
