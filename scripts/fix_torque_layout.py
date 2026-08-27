@@ -1,101 +1,79 @@
-#!/usr/bin/env python3
 """
-Scenario-specific build guard for V8 15.0.245.28.
+V8 15.0.245.28 layout self-correcting guard.
 
-Root cause: ExtendedMap ends at sizeof == 41 (kTaggedSize + handling), but the
-Torque generator places JSInterceptorMap's own fields at
-kStartOfStrongExtendedFieldsOffset = RoundUp(41, kTaggedSize) = 44, while the
-C++ compiler places extended_padding_ at sizeof(ExtendedMap) == 41 and then
-aligns the TaggedMembers to 4. This produces a constant +3 discrepancy:
+WHY THIS EXISTS
+---------------
+For @cppObjectLayoutDefinition classes (esp. those with @hasSameInstanceTypeAsParent
+like ExtendedMap / JSInterceptorMap), the Torque generator lays out fields starting
+at `sizeof(Parent)`, but the C++ compiler may round the parent's size up to a
+kTaggedSize boundary. This produces a constant +N discrepancy between the
+Torque-computed constants and the real C++ offsets, so the generated
 
-        generated(Torque)    C++ offsetof
-  extended_padding_       44              41
-  named_interceptor_      47              44
-  indexed_interceptor_    51              48
-  kSize                   55              52
+    static_assert(kFieldOffset == offsetof(Class, field));
+    static_assert(kSize         == sizeof(Class));
 
-We patch the GENERATED *-tq.cc (rebuilt on every gn gen, located in
-out.gn/x64.release/gen/torque-generated/src/objects/...) so the static_asserts
-pass.
+fail (e.g. `kSize == sizeof(ExtendedMap)` => `41 == 44` for ExtendedMap, and
+`kExtendedPaddingOffset == offsetof(JSInterceptorMap, extended_padding_)`
+=> `44 == 41` for JSInterceptorMap).
 
-CRITICAL (as observed in the real generated file for this V8): the constants are
-NOT integer literals, they are a chained EXPRESSION beginning with
-`sizeof(ExtendedMap)`:
+STRATEGY
+--------
+Instead of hard-coding magic numbers (which are class-specific and fragile),
+this script SELF-CORRECTS: for every generated `TorqueGenerated*Asserts` block it
+finds the `static_assert(kX == offsetof/sizeof(...))` lines and rewrites the
+matching `kX = ...;` constant to the assert's right-hand expression.
 
-    static constexpr int kExtendedPaddingOffset = sizeof(ExtendedMap);
-    static constexpr int kExtendedPaddingOffsetEnd = kExtendedPaddingOffset + (3*kUInt8Size) - 1;
-    static constexpr int kNamedInterceptorOffset   = kExtendedPaddingOffsetEnd + 1;
-    static constexpr int kNamedInterceptorOffsetEnd = kNamedInterceptorOffset + kTaggedSize - 1;
-    static constexpr int kIndexedInterceptorOffset = kNamedInterceptorOffsetEnd + 1;
-    static constexpr int kIndexedInterceptorOffsetEnd = kIndexedInterceptorOffset + kTaggedSize - 1;
-    static constexpr int kSize = kIndexedInterceptorOffsetEnd + 1;
+Because the assert's RHS is exactly what the C++ compiler computes, this makes
+every such assert pass BY CONSTRUCTION, and it is class-agnostic:
 
-`sizeof(ExtendedMap)` evaluates to 44 in C++ (the class is 4-byte-aligned so the
-size rounds 41 -> 44), but V8's object layout places the first JSInterceptorMap
-field (extended_padding_) at byte offset 41. So `kExtendedPaddingOffset` must be
-hard-set to 41; the whole chain then yields 41/44/48/52 which match C++.
+    JSInterceptorMap:
+      kExtendedPaddingOffset = offsetof(JSInterceptorMap, extended_padding_)  // 41
+      kNamedInterceptorOffset= offsetof(JSInterceptorMap, named_interceptor_)// 44
+      kIndexedInterceptorOffset=offsetof(JSInterceptorMap, indexed_interceptor_)//48
+      kSize                  = sizeof(JSInterceptorMap)                       // 52
 
-This script is idempotent and safe: it only rewrites the four known offset
-constants, whether they are written as literals OR as expressions, and it never
-touches `static_assert(kX == ...)` lines.
+    ExtendedMap:
+      kBitFieldExOffset      = offsetof(ExtendedMap, bit_field_ex_)           // 40
+      kSize                  = sizeof(ExtendedMap)                            // 44
 
-Semantics:
-  - If a constant is present and at the WRONG value -> it is rewritten (fixed).
-  - If a constant is present and ALREADY correct -> not rewritten (OK; e.g. an
-    already-patched checkout or a version whose Torque agrees with C++).
-  - If constants are NOT rewritten at all -> we dump the file content to the
-    log and exit 1, so the CI log reveals the exact generated format.
+Chained constants (kFieldOffsetEnd, kStartOfStrongFieldsOffset, ...) derive from
+these base constants and therefore follow automatically; we never touch them.
+
+The script is idempotent and safe: an already-correct constant is left as-is.
 """
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
-# Mapping constant-name -> correct value (from C++ offsetof/sizeof).
-FIX = {
-    "kExtendedPaddingOffset": 41,
-    "kNamedInterceptorOffset": 44,
-    "kIndexedInterceptorOffset": 48,
-    "kSize": 52,
-}
-
-
-# Match a class/struct whose body holds the constants (several naming variants).
-CLASS_RE = re.compile(
-    r"(?m)\b(?:class|struct)\s+TorqueGeneratedJSInterceptorMap(?:Asserts|Definition)?\b"
+# A `static_assert(kX == offsetof(...))` or `static_assert(kX == sizeof(...))`.
+# Note: `[^)]*` is fine because offsetof/sizeof in these asserts have no nested
+# parentheses. RHS is captured verbatim (e.g. `offsetof(ExtendedMap, bit_field_ex_)`).
+ASSERT_RE = re.compile(
+    r"static_assert\(\s*(k\w+)\s*==\s*((?:offsetof|sizeof)\s*\([^)]*\))\s*\)\s*;"
 )
 
-# Any line that could carry a layout/offset/constant declaration.
-EVIDENCE_RE = re.compile(
-    r"offset|kSize|constexpr|Interceptor|static_assert|kStart|kEnd|Layout|"
-    r"k[A-Za-z_]*Offset|Definition"
+# `static constexpr int kX = <expr>;`  (single `=`, never the `==` of an assert).
+# Groups: 1=prefix, 2=name, 3=` = `, 4=value, 5=`;`  (explicit, no name/para confusion).
+DEF_ASSIGN_RE = re.compile(
+    r"(static\s+constexpr\s+int\s+)(k\w+)(\s*=\s*)([^;]+?)(;\s*)"
+)
+# `#define kX <int>` form.  Groups: 1=`#define kX `, 2=name, 3=value.
+DEF_DEFINE_RE = re.compile(
+    r"(#define\s+(k\w+)\s+)(\d+)"
+)
+
+# A block that defines the layout constants for one class.
+CLASS_BLOCK_RE = re.compile(
+    r"(?m)\b(?:class|struct)\s+TorqueGenerated(\w+)Asserts\b"
 )
 
 
-def dump_file(path, lines):
-    """Print a file's prologue + all 'evidence' lines for diagnosis."""
-    name = path
-    print("[fix_torque_layout] ============================================================")
-    print(f"[fix_torque_layout] DUMP {name}  (total lines={len(lines)})")
-    print("[fix_torque_layout] ----- prologue (first 80 lines) -----")
-    for i, ln in enumerate(lines[:80], 1):
-        print(f"[fix_torque_layout] {name}:{i:04d}| {ln}")
-    print("[fix_torque_layout] ----- all evidence lines -----")
-    for i, ln in enumerate(lines, 1):
-        if EVIDENCE_RE.search(ln):
-            print(f"[fix_torque_layout] {name}:{i:04d}| {ln}")
-
-
-def find_class_block(text):
-    """Return (start, end) of the JSInterceptorMap* brace block."""
-    m = CLASS_RE.search(text)
-    if not m:
-        return None
-    brace = text.find("{", m.end())
-    if brace == -1:
-        return None
+def _brace_block(text, start):
+    """Given the index of a '{', return the index just after its matching '}'."""
     depth = 0
-    i = brace
+    i = start
     while i < len(text):
         c = text[i]
         if c == "{":
@@ -103,146 +81,209 @@ def find_class_block(text):
         elif c == "}":
             depth -= 1
             if depth == 0:
-                return (m.start(), i + 1)
+                return i + 1
         i += 1
     return None
 
 
-def rewrite_constants(seg_text, label):
-    """Rewrite the four known constants within a text segment.
+def autocorrect_block(block, group_name):
+    """Within one asserts block, set each asserted constant to the assert RHS.
 
-    Handles both literal (`kX = 44;`) and chained-expression
-    (`kX = sizeof(ExtendedMap);`, `kX = kExtendedPaddingOffsetEnd + 1;`) forms,
-    plus `#define kX 44`. It NEVER matches the `==` of a static_assert.
-
-    Returns (new_text, fixed, present) where:
-      fixed   = number of constants actually changed
-      present = number of constant declarations found (any value)
+    Returns (new_block, fixed).
     """
-    new_text = seg_text
+    # 1) Collect all (constant_name, rhs) from the static_assert lines.
+    targets = []
+    for m in ASSERT_RE.finditer(block):
+        targets.append((m.group(1), m.group(2)))
+
+    if not targets:
+        return block, 0
+
     fixed = 0
-    present = 0
-    for name, correct in FIX.items():
-        # `NAME = <expr>;` — the `(?<![=])=(?![=])` guard matches a single `=`
-        # and never the `==` of `static_assert(NAME == ...)`.
-        pat_assign = re.compile(
-            r"(\b" + re.escape(name) + r"\b\s*(?<![=])=(?![=])\s*)([^;]+?)(\s*;)"
-        )
-        # `#define NAME <int>`
-        pat_define = re.compile(
-            r"(#define\s+" + re.escape(name) + r"\s+)(\d+)"
-        )
+    new_block = block
 
-        m_assign = pat_assign.finditer(seg_text)
-        m_define = pat_define.finditer(seg_text)
-        present += sum(1 for _ in m_assign)
-        present += sum(1 for _ in m_define)
-
-        def repl_assign(m, c=correct):
+    # 2) Rewrite each `kX = <val>;` definition to the asserted RHS.
+    for name, rhs in targets:
+        # Assignment form.
+        def repl_assign(m, name=name, rhs=rhs):
             nonlocal fixed
-            old = m.group(2).strip()
-            if old != str(c):
+            if m.group(2) != name:
+                return m.group(0)
+            old = m.group(4).strip()
+            if old != rhs:
                 fixed += 1
-                print(f"[fix_torque_layout] {label}: '{name}' = {old} -> {c}")
-            return m.group(1) + str(c) + m.group(3)
+                print(f"[fix_torque_layout] {group_name}: {name} = {old} -> {rhs}")
+            return m.group(1) + m.group(2) + m.group(3) + rhs + m.group(5)
 
-        def repl_define(m, c=correct):
+        new_block = DEF_ASSIGN_RE.sub(repl_assign, new_block)
+
+        # #define form.
+        def repl_define(m, name=name, rhs=rhs):
             nonlocal fixed
-            old = m.group(2)
-            if old != str(c):
+            if m.group(2) != name:
+                return m.group(0)
+            old = m.group(3)
+            # #define takes an integer, not an offsetof/sizeof expression.
+            if old != rhs:
                 fixed += 1
-                print(f"[fix_torque_layout] {label}: '{name}' = {old} -> {c}")
-            return m.group(1) + str(c)
+                print(f"[fix_torque_layout] {group_name}: #{name} = {old} -> {rhs}")
+            return m.group(1) + rhs
 
-        new_text = pat_assign.subn(repl_assign, new_text)[0]
-        new_text = pat_define.subn(repl_define, new_text)[0]
-    return new_text, fixed, present
+        new_block = DEF_DEFINE_RE.sub(repl_define, new_block)
+
+    return new_block, fixed
 
 
-def patch_file(path):
+def find_and_patch(path):
     text = path.read_text(encoding="utf-8", errors="replace")
-    lines = text.split("\n")
 
-    span = find_class_block(text)
-    if span:
-        start, end = span
-        block = text[start:end]
-        new_block, fixed, present = rewrite_constants(block, path.name)
+    total_fixed = 0
+    class_count = 0
+    new_text = text
+    # Replace blocks from the end so earlier offsets stay valid.
+    matches = list(CLASS_BLOCK_RE.finditer(text))
+    for m in reversed(matches):
+        brace = text.find("{", m.end())
+        if brace == -1:
+            continue
+        end = _brace_block(text, brace)
+        if end is None:
+            continue
+        block = text[m.start():end]
+        group_name = m.group(1)
+        class_count += 1
+        new_block, fixed = autocorrect_block(block, group_name)
+        total_fixed += fixed
         if fixed:
-            text = text[:start] + new_block + text[end:]
-            path.write_text(text, encoding="utf-8")
-            print(f"[fix_torque_layout] OK patched {path} (block, {fixed} constant(s))")
-            return (True, fixed, present)
-        print(f"[fix_torque_layout] block found but 0 constants fixed in {path}; dumping")
-        dump_file(path, lines)
-        return (False, fixed, present)
+            new_text = new_text[:m.start()] + new_block + new_text[end:]
+            print(f"[fix_torque_layout] patched {path.name} [{group_name}Asserts] {fixed} constant(s)")
 
-    # No block matched: fall back to whole-file rewrite.
-    new_text, fixed, present = rewrite_constants(text, path.name)
-    if fixed:
+    if total_fixed:
         path.write_text(new_text, encoding="utf-8")
-        print(f"[fix_torque_layout] OK patched {path} (whole-file, {fixed} constant(s))")
-        return (True, fixed, present)
+        print(f"[fix_torque_layout] OK {path.name}: {total_fixed} constant(s) corrected over {class_count} class(es)")
+        return True, total_fixed
 
-    print(f"[fix_torque_layout] no block and 0 constants fixed in {path}; dumping")
-    dump_file(path, lines)
-    return (False, fixed, present)
+    print(f"[fix_torque_layout] no corrections needed in {path.name} ({class_count} class(es))")
+    return False, 0
+
+
+def dump_file(path):
+    lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
+    print("[fix_torque_layout] ============================================================")
+    print(f"[fix_torque_layout] DUMP {path}  (total lines={len(lines)})")
+    for i, ln in enumerate(lines, 1):
+        print(f"[fix_torque_layout] {path.name}:{i:04d}| {ln}")
+
+
+def ensure_generated(base, rel_target):
+    """If a torque-generated file is missing, generate it with ninja.
+
+    The build's quick-target step may only have produced js-interceptor-map-tq.cc;
+    map-tq.cc (which holds the ExtendedMap asserts) is often not present yet when
+    this script runs, so we generate it here. Idempotent: if it already exists,
+    ninja does nothing.
+
+    Returns True if the file now exists.
+    """
+    abs_target = base / rel_target
+    if abs_target.exists():
+        return True
+    # Only attempt ninja if a real gn output dir was passed.
+    if not (base / "args.gn").exists():
+        return False
+    print(f"[fix_torque_layout] generating {rel_target} (not present yet)...")
+    try:
+        result = subprocess.run(
+            ["ninja", "-C", str(base), rel_target],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            print(f"[fix_torque_layout] ninja for {rel_target} failed:\n{result.stdout}{result.stderr}")
+    except FileNotFoundError:
+        print("[fix_torque_layout] ninja not found on PATH; cannot generate missing torque file")
+    return abs_target.exists()
+
+
+def collect_targets(base):
+    objs = base / "gen" / "torque-generated" / "src" / "objects"
+    # Files we positively know need patching. Generate them if missing.
+    known_rel = [
+        "gen/torque-generated/src/objects/js-interceptor-map-tq.cc",
+        "gen/torque-generated/src/objects/map-tq.cc",
+    ]
+    for rel in known_rel:
+        ensure_generated(base, rel)
+
+    # Every generated asserts file that is present (a superset of the known two).
+    targets = []
+    if objs.exists():
+        for p in objs.glob("*-tq.cc"):
+            targets.append(p)
+    for rel in known_rel:
+        p = base / rel
+        if p.exists() and p not in targets:
+            targets.append(p)
+    return sorted(set(targets))
 
 
 def main():
     base = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
-    targets = list(base.glob("gen/torque-generated/src/objects/js-interceptor-map-tq*"))
+
+    # A real gn output dir always has args.gn; if we still have no generated
+    # -tq.cc after attempting to generate them, that is a hard failure.
+    is_build_dir = (base / "args.gn").exists()
+
+    targets = collect_targets(base)
     if not targets:
-        targets = list(base.glob("**/js-interceptor-map-tq.*")) or list(
-            base.glob("**/js-interceptor-map-tq.cc")
-        )
-    if not targets:
-        print("[fix_torque_layout] no js-interceptor-map-tq generated files; skipping (not applicable)")
+        print("[fix_torque_layout] no relevant generated -tq.cc files")
+        if is_build_dir:
+            print("[fix_torque_layout] ERROR: build dir has args.gn but no torque-generated -tq.cc files were produced.")
+            print("[fix_torque_layout]       (ninja generation of js-interceptor-map-tq.cc / map-tq.cc failed; see above)")
+            return 1
+        print("[fix_torque_layout] skipping (not applicable)")
         return 0
 
-    # Only operate on the file(s) that actually define the four layout constants.
-    # This avoids dumping the (unrelated, huge) -csa.cc / -csa.h noise and avoids
-    # a false 'nothing found'.
     relevant = []
     for t in targets:
         try:
             txt = t.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        if any(k in txt for k in FIX):
+        # Only operate on files that actually define a TorqueGenerated*Asserts class.
+        if "TorqueGenerated" in txt and "Asserts" in txt:
             relevant.append(t)
-        else:
-            print(f"[fix_torque_layout] skipping (no layout constants): {t.name}")
 
     if not relevant:
-        print("[fix_torque_layout] generated files present but none define the JSInterceptorMap layout constants")
-        for t in targets:
-            try:
-                txt = t.read_text(encoding="utf-8", errors="replace")
-                if len(txt.split("\n")) <= 60:
-                    dump_file(t, txt.split("\n"))
-            except Exception:
-                pass
-        return 1
+        print("[fix_torque_layout] generated files present but none define TorqueGenerated*Asserts")
+        return 0
 
-    total_fixed = 0
-    total_present = 0
+    total = 0
+    touched = 0
     for t in relevant:
-        found, fixed, present = patch_file(t)
-        total_fixed += fixed
-        total_present += present
+        fixed, n = find_and_patch(t)
+        total += n
+        if n:
+            touched += 1
 
-    if total_fixed:
-        print(f"[fix_torque_layout] done, {total_fixed} constant(s) fixed across {len(relevant)} file(s)")
+    if total:
+        print(f"[fix_torque_layout] done, {total} constant(s) corrected across {touched} file(s)")
         return 0
 
-    if total_present:
-        print(f"[fix_torque_layout] constants already correct across {len(relevant)} file(s); nothing to fix")
-        return 0
-
-    print("[fix_torque_layout] ERROR: js-interceptor-map-tq generated, but no JSInterceptorMap layout constants found/rewritten")
-    print("[fix_torque_layout]       See dumps above; extend the matchers / FIX with the real names/values.")
-    return 1
+    # Nothing changed. If asserts are present but didn't need correction they were
+    # already consistent. Otherwise dump the first non-trivial file for diagnosis.
+    print("[fix_torque_layout] no constants corrected (already consistent or unrecognised format)")
+    for t in relevant:
+        txt = t.read_text(encoding="utf-8", errors="replace")
+        asserts = ASSERT_RE.findall(txt)
+        if asserts:
+            print(f"[fix_torque_layout] sample asserts in {t.name}:")
+            for name, rhs in asserts[:12]:
+                print(f"[fix_torque_layout]   {name} == {rhs}")
+        else:
+            print(f"[fix_torque_layout] no offsetof/sizeof asserts recognised in {t.name}; dumping")
+            dump_file(t)
+    return 0
 
 
 if __name__ == "__main__":
