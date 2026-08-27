@@ -67,15 +67,30 @@ jobs:
           mkdir $release
           cp "..\..\scripts\args.gn" "$release\args.gn" -Force
           gn gen $release
+          $releaseAbs = (Resolve-Path $release).Path
+          $torqueFile = Join-Path $releaseAbs "gen\torque-generated\src\objects\js-interceptor-map-tq.cc"
 
-          # Fix Torque-vs-C++ layout mismatch in generated JSInterceptorMap
-          # (needed for V8 15.0.245.28). See scripts/fix_torque_layout.py.
-          $fix = Join-Path $env:GITHUB_WORKSPACE "scripts\fix_torque_layout.py"
-          if (-not (Test-Path $fix)) { throw "fix_torque_layout.py not found: $fix" }
-          Write-Host "[fix_torque_layout] patching generated JSInterceptorMap..."
-          python $fix $release
+          # Pass 1: the Torque-generated *-tq.cc files are produced as a ninja
+          # build step (NOT by gn gen). This first d8 pass materializes them and
+          # WILL fail at the JSInterceptorMap static_assert (44==41 etc). That
+          # failure is expected; we ignore its exit code, patch, then rebuild.
+          Write-Host "[fix_torque_layout] pass 1: generating torque files (this pass is expected to hit the layout static_assert)..."
+          ninja -C $release d8
+          Write-Host "[fix_torque_layout] pass 1 exit=$LASTEXITCODE (expected non-zero, continuing)"
+
+          if (-not (Test-Path $torqueFile)) { throw "torque file missing: $torqueFile" }
+          Write-Host "[fix_torque_layout] torque generated: $torqueFile"
+
+          # Patch the four JSInterceptorMap offset constants to the true C++
+          # offsets (41/44/48/52) so both static_asserts and accessors agree.
+          $fixScript = Join-Path $env:GITHUB_WORKSPACE "scripts\fix_torque_layout.py"
+          if (-not (Test-Path $fixScript)) { throw "fix_torque_layout.py not found: $fixScript" }
+          Write-Host "[fix_torque_layout] patching generated constants..."
+          python $fixScript $releaseAbs
           if ($LASTEXITCODE -ne 0) { throw "fix_torque_layout failed (exit $LASTEXITCODE)" }
 
+          # Pass 2: real build with the corrected generated file.
+          Write-Host "[fix_torque_layout] pass 2: building d8..."
           ninja -C $release d8
 
           $artifact = "d8-with-disassembler-$env:V8_BRANCH"
