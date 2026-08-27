@@ -1,4 +1,4 @@
-pythonCopy#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Scenario-specific build guard for V8 15.0.245.28.
 
